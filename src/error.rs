@@ -19,6 +19,10 @@ pub type Result<T, E = CdpError> = std::result::Result<T, E>;
 
 #[derive(Debug, Error)]
 pub enum CdpError {
+    #[error("Команда запрещена connection policy: {0}")]
+    Policy(String),
+    #[error("Соединение завершено: {0}")]
+    Disconnected(String),
     #[error("{0}")]
     Ws(#[from] tungstenite::Error),
     #[error("{0}")]

@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::ready;
+use std::time::Duration;
 
 use async_tungstenite::tungstenite::Message as WsMessage;
 use async_tungstenite::{WebSocketStream, tungstenite::protocol::WebSocketConfig};
@@ -29,6 +31,9 @@ pub struct Connection<T: EventMessage> {
     needs_flush: bool,
     /// The message that is currently being proceessed
     pending_flush: Option<MethodCall>,
+    disconnect_sent: bool,
+    disconnect_received: bool,
+    disconnect_timeout: Option<futures_timer::Delay>,
     _marker: PhantomData<T>,
 }
 
@@ -50,12 +55,48 @@ impl<T: EventMessage + Unpin> Connection<T> {
             next_id: 0,
             needs_flush: false,
             pending_flush: None,
+            disconnect_sent: false,
+            disconnect_received: false,
+            disconnect_timeout: None,
             _marker: Default::default(),
         })
     }
 }
 
 impl<T: EventMessage> Connection<T> {
+    /// Отбросить ещё не отправленные команды и завершить WebSocket handshake.
+    pub(crate) fn poll_disconnect(
+        &mut self,
+        cx: &mut Context<'_>,
+        timeout: Duration,
+    ) -> Poll<Result<()>> {
+        let deadline = self
+            .disconnect_timeout
+            .get_or_insert_with(|| futures_timer::Delay::new(timeout));
+        if Pin::new(deadline).poll(cx).is_ready() {
+            return Poll::Ready(Err(CdpError::Timeout));
+        }
+        self.pending_commands.clear();
+        self.pending_flush = None;
+        if !self.disconnect_sent {
+            ready!(self.ws.poll_close_unpin(cx))?;
+            self.disconnect_sent = true;
+        }
+        // poll_close отправляет Close, но не ждёт ответа peer. Не отдаём
+        // завершение до handshake: ранний drop может сбросить socket с данными.
+        while !self.disconnect_received {
+            match ready!(self.ws.poll_next_unpin(cx)) {
+                Some(Ok(WsMessage::Close(_))) | None => self.disconnect_received = true,
+                Some(Ok(_)) => {}
+                Some(Err(async_tungstenite::tungstenite::Error::ConnectionClosed)) => {
+                    self.disconnect_received = true
+                }
+                Some(Err(error)) => return Poll::Ready(Err(error.into())),
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
     fn next_call_id(&mut self) -> CallId {
         let id = CallId::new(self.next_id);
         self.next_id = self.next_id.wrapping_add(1);

@@ -43,10 +43,16 @@ pub mod httpfuture;
 mod job;
 pub mod network;
 mod page;
+mod policy;
+pub use policy::ConnectionPolicy;
+#[cfg(test)]
+mod scoped_tests;
 mod session;
 pub mod target;
 pub mod target_message_future;
 pub mod viewport;
+
+type ScopedFetch = (OneshotSender<Result<Vec<TargetInfo>>>, Vec<TargetInfo>);
 
 /// The handler that monitors the state of the chromium browser and drives all
 /// the requests and events.
@@ -83,30 +89,98 @@ pub struct Handler {
     event_listeners: EventListeners,
     /// Keeps track is the browser is closing
     closing: bool,
+    disconnecting: bool,
+    disconnected: bool,
+    disconnect_tx: Option<OneshotSender<Result<()>>>,
+    failure: Option<CdpError>,
+    scoped_fetches: Vec<ScopedFetch>,
 }
 
 impl Handler {
+    fn selected_session(&self) -> Option<&SessionId> {
+        let id = self.config.connection_policy.target_id()?;
+        self.sessions
+            .iter()
+            .find(|(_, s)| s.target_id() == id)
+            .map(|(id, _)| id)
+    }
+
+    /// Общая граница до постановки команд в транспортную очередь.
+    fn queue_command(
+        &mut self,
+        method: MethodId,
+        session: Option<SessionId>,
+        params: serde_json::Value,
+        internal: bool,
+    ) -> Result<CallId> {
+        self.config.connection_policy.check(
+            method.as_ref(),
+            session.as_ref(),
+            self.selected_session(),
+            &params,
+            internal,
+        )?;
+        Ok(self.conn.submit_command(method, session, params)?)
+    }
+
+    fn fail(&mut self, error: CdpError) {
+        let reason = error.to_string();
+        for (_, (request, _, _)) in self.pending_commands.drain() {
+            let error = CdpError::Disconnected(reason.clone());
+            match request {
+                PendingRequest::CreateTarget(tx) => {
+                    let _ = tx.send(Err(error));
+                }
+                PendingRequest::GetTargets(tx) => {
+                    let _ = tx.send(Err(error));
+                }
+                PendingRequest::ExternalCommand(tx) => {
+                    let _ = tx.send(Err(error));
+                }
+                PendingRequest::CloseBrowser(tx) => {
+                    let _ = tx.send(Err(error));
+                }
+                PendingRequest::InternalCommand(_) | PendingRequest::Navigate(_) => {}
+            }
+        }
+        for (_, request) in self.navigations.drain() {
+            let NavigationRequest::Navigate(nav) = request;
+            let _ = nav.tx.send(Err(CdpError::Disconnected(reason.clone())));
+        }
+        for (tx, _) in self.scoped_fetches.drain(..) {
+            let _ = tx.send(Err(CdpError::Disconnected(reason.clone())));
+        }
+        self.targets.clear();
+        self.target_ids.clear();
+        self.sessions.clear();
+        self.from_browser.get_mut().close();
+        self.disconnecting = true;
+        self.failure = Some(error);
+    }
+
+    fn complete_scoped_fetches(&mut self) {
+        if let Some(id) = self.config.connection_policy.target_id() {
+            if self.targets.get(id).is_some_and(Target::is_initialized) {
+                for (tx, infos) in self.scoped_fetches.drain(..) {
+                    let _ = tx.send(Ok(infos));
+                }
+            }
+        }
+    }
     /// Create a new `Handler` that drives the connection and listens for
     /// messages on the receiver `rx`.
     pub(crate) fn new(
-        mut conn: Connection<CdpEventMessage>,
+        conn: Connection<CdpEventMessage>,
         rx: Receiver<HandlerMessage>,
         config: HandlerConfig,
     ) -> Self {
-        let discover = SetDiscoverTargetsParams::new(true);
-        let _ = conn.submit_command(
-            discover.identifier(),
-            None,
-            serde_json::to_value(discover).unwrap(),
-        );
-
         let browser_contexts = config
             .context_ids
             .iter()
             .map(|id| BrowserContext::from(id.clone()))
             .collect();
 
-        Self {
+        let mut handler = Self {
             pending_commands: Default::default(),
             from_browser: rx.fuse(),
             default_browser_context: Default::default(),
@@ -121,7 +195,21 @@ impl Handler {
             config,
             event_listeners: Default::default(),
             closing: false,
+            disconnecting: false,
+            disconnected: false,
+            disconnect_tx: None,
+            failure: None,
+            scoped_fetches: Vec::new(),
+        };
+        let discover = SetDiscoverTargetsParams::new(true);
+        match serde_json::to_value(&discover)
+            .map_err(CdpError::from)
+            .and_then(|params| handler.queue_command(discover.identifier(), None, params, true))
+        {
+            Ok(_) => {}
+            Err(error) => handler.fail(error),
         }
+        handler
     }
 
     /// Return the target with the matching `target_id`
@@ -218,6 +306,27 @@ impl Handler {
                         Ok(resp) => {
                             let targets: Vec<TargetInfo> = resp.result.target_infos;
                             let results = targets.clone();
+                            if let Some(id) = self.config.connection_policy.target_id() {
+                                let selected = targets.iter().find(|info| &info.target_id == id);
+                                match selected {
+                                    Some(info) if info.r#type == "page" => {
+                                        self.scoped_fetches.push((tx, vec![info.clone()]));
+                                    }
+                                    _ => {
+                                        let reason = format!(
+                                            "Выбранный target {id:?} отсутствует или не является page"
+                                        );
+                                        let _ = tx.send(Err(CdpError::msg(reason.clone())));
+                                        self.fail(CdpError::msg(reason));
+                                        return;
+                                    }
+                                }
+                                for target_info in targets {
+                                    self.on_target_created(EventTargetCreated { target_info });
+                                }
+                                self.complete_scoped_fetches();
+                                return;
+                            }
                             for target_info in targets {
                                 let target_id = target_info.target_id.clone();
                                 let event: EventTargetCreated = EventTargetCreated { target_info };
@@ -233,7 +342,11 @@ impl Handler {
                             let _ = tx.send(Ok(results)).ok();
                         }
                         Err(err) => {
-                            let _ = tx.send(Err(err)).ok();
+                            let reason = err.to_string();
+                            let _ = tx.send(Err(err));
+                            if self.config.connection_policy.target_id().is_some() {
+                                self.fail(CdpError::msg(reason));
+                            }
                         }
                     }
                 }
@@ -244,6 +357,33 @@ impl Handler {
                     let _ = tx.send(Ok(resp)).ok();
                 }
                 PendingRequest::InternalCommand(target_id) => {
+                    if method.as_ref() == "Target.attachToTarget"
+                        && self.config.connection_policy.target_id().is_some()
+                    {
+                        if let Some(error) = resp.error {
+                            self.fail(CdpError::Chrome(error));
+                            return;
+                        }
+                        let session = resp
+                            .result
+                            .as_ref()
+                            .and_then(|v| v.get("sessionId"))
+                            .and_then(|v| v.as_str());
+                        match session {
+                            Some(id) => {
+                                let id = SessionId::from(id.to_owned());
+                                if let Some(target) = self.targets.get_mut(&target_id) {
+                                    target.set_session_id(id.clone());
+                                }
+                                self.sessions
+                                    .insert(id.clone(), Session::new(id, target_id));
+                            }
+                            None => {
+                                self.fail(CdpError::msg("attachToTarget: отсутствует sessionId"))
+                            }
+                        }
+                        return;
+                    }
                     if let Some(target) = self.targets.get_mut(&target_id) {
                         target.on_response(resp, method.as_ref());
                     }
@@ -262,9 +402,14 @@ impl Handler {
         msg: CommandMessage,
         now: Instant,
     ) -> Result<()> {
-        let call_id = self
-            .conn
-            .submit_command(msg.method.clone(), msg.session_id, msg.params)?;
+        let call_id =
+            match self.queue_command(msg.method.clone(), msg.session_id, msg.params, false) {
+                Ok(id) => id,
+                Err(error) => {
+                    let _ = msg.sender.send(Err(error));
+                    return Ok(());
+                }
+            };
         self.pending_commands.insert(
             call_id,
             (PendingRequest::ExternalCommand(msg.sender), msg.method, now),
@@ -278,10 +423,11 @@ impl Handler {
         req: CdpRequest,
         now: Instant,
     ) -> Result<()> {
-        let call_id = self.conn.submit_command(
+        let call_id = self.queue_command(
             req.method.clone(),
             req.session_id.map(Into::into),
             req.params,
+            true,
         )?;
         self.pending_commands.insert(
             call_id,
@@ -293,10 +439,16 @@ impl Handler {
     fn submit_fetch_targets(&mut self, tx: OneshotSender<Result<Vec<TargetInfo>>>, now: Instant) {
         let msg = GetTargetsParams { filter: None };
         let method = msg.identifier();
-        let call_id = self
-            .conn
-            .submit_command(method.clone(), None, serde_json::to_value(msg).unwrap())
-            .unwrap();
+        let call_id = match serde_json::to_value(msg)
+            .map_err(CdpError::from)
+            .and_then(|params| self.queue_command(method.clone(), None, params, true))
+        {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = tx.send(Err(error));
+                return;
+            }
+        };
 
         self.pending_commands
             .insert(call_id, (PendingRequest::GetTargets(tx), method, now));
@@ -305,20 +457,30 @@ impl Handler {
     /// Send the Request over to the server and store its identifier to handle
     /// the response once received.
     fn submit_navigation(&mut self, id: NavigationId, req: CdpRequest, now: Instant) {
-        let call_id = self
-            .conn
-            .submit_command(
-                req.method.clone(),
-                req.session_id.map(Into::into),
-                req.params,
-            )
-            .unwrap();
+        let call_id = match self.queue_command(
+            req.method.clone(),
+            req.session_id.map(Into::into),
+            req.params,
+            false,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                if let Some(NavigationRequest::Navigate(nav)) = self.navigations.remove(&id) {
+                    let _ = nav.tx.send(Err(error));
+                }
+                return;
+            }
+        };
 
         self.pending_commands
             .insert(call_id, (PendingRequest::Navigate(id), req.method, now));
     }
 
     fn submit_close(&mut self, tx: OneshotSender<Result<CloseReturns>>, now: Instant) {
+        if self.config.connection_policy.target_id().is_some() {
+            let _ = tx.send(Err(CdpError::Policy("Browser.close".into())));
+            return;
+        }
         let close_msg = CloseParams::default();
         let method = close_msg.identifier();
 
@@ -369,6 +531,10 @@ impl Handler {
     /// ready and idle), the `Target` sends its newly created `Page` as response
     /// to the initiator (`tx`) of the `CreateTargetParams` request.
     fn create_page(&mut self, params: CreateTargetParams, tx: OneshotSender<Result<Page>>) {
+        if self.config.connection_policy.target_id().is_some() {
+            let _ = tx.send(Err(CdpError::Policy("Target.createTarget".into())));
+            return;
+        }
         match url::Url::parse(&params.url) {
             Ok(_) => {
                 let method = params.identifier();
@@ -397,6 +563,24 @@ impl Handler {
 
     /// Process an incoming event read from the websocket
     fn on_event(&mut self, event: CdpEventMessage) {
+        if self.config.connection_policy.target_id().is_some() {
+            if let Some(ref session) = event.session_id {
+                if self.selected_session().map(|id| id.as_ref()) != Some(session.as_str()) {
+                    return;
+                }
+            }
+            match &event.params {
+                CdpEvent::TargetTargetDestroyed(ev) => {
+                    self.on_target_destroyed(ev.clone());
+                    return;
+                }
+                CdpEvent::TargetDetachedFromTarget(ev) => {
+                    self.on_detached_from_target(ev.clone());
+                    return;
+                }
+                _ => {}
+            }
+        }
         if let Some(ref session_id) = event.session_id {
             if let Some(session) = self.sessions.get(session_id.as_str()) {
                 if let Some(target) = self.targets.get_mut(session.target_id()) {
@@ -422,6 +606,20 @@ impl Handler {
     ///
     /// Creates a new `Target` instance and keeps track of it
     fn on_target_created(&mut self, event: EventTargetCreated) {
+        if let Some(id) = self.config.connection_policy.target_id() {
+            if &event.target_info.target_id != id {
+                return;
+            }
+            if event.target_info.r#type != "page" {
+                self.fail(CdpError::msg(format!(
+                    "Выбранный target {id:?} не является page"
+                )));
+                return;
+            }
+            if self.targets.contains_key(id) {
+                return;
+            }
+        }
         let browser_ctx = event
             .target_info
             .browser_context_id
@@ -432,6 +630,7 @@ impl Handler {
         let target = Target::new(
             event.target_info,
             TargetConfig {
+                non_destructive: self.config.connection_policy.target_id().is_some(),
                 ignore_https_errors: self.config.ignore_https_errors,
                 request_timeout: self.config.request_timeout,
                 viewport: self.config.viewport.clone(),
@@ -446,6 +645,10 @@ impl Handler {
 
     /// A new session is attached to a target
     fn on_attached_to_target(&mut self, event: Box<EventAttachedToTarget>) {
+        // Session регистрируется из ответа на наш attach, не из unsolicited events.
+        if self.config.connection_policy.target_id().is_some() {
+            return;
+        }
         let session = Session::new(event.session_id.clone(), event.target_info.target_id);
         if let Some(target) = self.targets.get_mut(session.target_id()) {
             target.set_session_id(session.session_id().clone())
@@ -457,6 +660,12 @@ impl Handler {
     /// Can be issued multiple times per target if multiple session have been
     /// attached to it.
     fn on_detached_from_target(&mut self, event: EventDetachedFromTarget) {
+        if self.config.connection_policy.target_id().is_some()
+            && self.selected_session() == Some(&event.session_id)
+        {
+            self.fail(CdpError::msg("Выбранная session отсоединена"));
+            return;
+        }
         // remove the session
         if let Some(session) = self.sessions.remove(&event.session_id) {
             if let Some(target) = self.targets.get_mut(session.target_id()) {
@@ -467,6 +676,10 @@ impl Handler {
 
     /// Fired when the target was destroyed in the browser
     fn on_target_destroyed(&mut self, event: EventTargetDestroyed) {
+        if self.config.connection_policy.target_id() == Some(&event.target_id) {
+            self.fail(CdpError::msg("Выбранный target уничтожен"));
+            return;
+        }
         if let Some(target) = self.targets.remove(&event.target_id) {
             // TODO shutdown?
             if let Some(session) = target.session_id() {
@@ -494,6 +707,9 @@ impl Handler {
                     }
                     PendingRequest::GetTargets(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
+                        if self.config.connection_policy.target_id().is_some() {
+                            self.fail(CdpError::msg("Target.getTargets: timeout"));
+                        }
                     }
                     PendingRequest::Navigate(nav) => {
                         if let Some(nav) = self.navigations.remove(&nav) {
@@ -507,7 +723,13 @@ impl Handler {
                     PendingRequest::ExternalCommand(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
-                    PendingRequest::InternalCommand(_) => {}
+                    PendingRequest::InternalCommand(id) => {
+                        if self.config.connection_policy.target_id() == Some(&id) {
+                            self.fail(CdpError::msg(format!(
+                                "Инициализация target {id:?}: timeout"
+                            )));
+                        }
+                    }
                     PendingRequest::CloseBrowser(tx) => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
@@ -528,6 +750,28 @@ impl Stream for Handler {
         let pin = self.get_mut();
 
         loop {
+            if pin.disconnected {
+                return Poll::Ready(None);
+            }
+            if let Some(error) = pin.failure.take() {
+                return Poll::Ready(Some(Err(error)));
+            }
+            if pin.disconnecting {
+                let result =
+                    futures::ready!(pin.conn.poll_disconnect(cx, pin.config.request_timeout));
+                pin.disconnected = true;
+                if let Some(tx) = pin.disconnect_tx.take() {
+                    let response = match &result {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(CdpError::Disconnected(error.to_string())),
+                    };
+                    let _ = tx.send(response);
+                }
+                return match result {
+                    Ok(()) => Poll::Ready(None),
+                    Err(error) => Poll::Ready(Some(Err(error))),
+                };
+            }
             let now = Instant::now();
             // temporary pinning of the browser receiver should be safe as we are pinning
             // through the already pinned self. with the receivers we can also
@@ -542,6 +786,12 @@ impl Stream for Handler {
                     }
                     HandlerMessage::CloseBrowser(tx) => {
                         pin.submit_close(tx, now);
+                    }
+                    HandlerMessage::Disconnect(tx) => {
+                        pin.disconnect_tx = Some(tx);
+                        pin.fail(CdpError::Disconnected("Явный disconnect".into()));
+                        pin.failure = None;
+                        break;
                     }
                     HandlerMessage::CreatePage(params, tx) => {
                         pin.create_page(params, tx);
@@ -576,17 +826,33 @@ impl Stream for Handler {
                 }
             }
 
+            if pin.disconnecting {
+                continue;
+            }
+            if pin.config.connection_policy.target_id().is_some() && pin.from_browser.is_done() {
+                pin.fail(CdpError::Disconnected("Browser освобождён".into()));
+                pin.failure = None;
+                continue;
+            }
+
             for n in (0..pin.target_ids.len()).rev() {
                 let target_id = pin.target_ids.swap_remove(n);
                 if let Some((id, mut target)) = pin.targets.remove_entry(&target_id) {
                     while let Some(event) = target.poll(cx, now) {
                         match event {
+                            TargetEvent::InitializationFailed(reason) => {
+                                pin.fail(CdpError::msg(reason));
+                                break;
+                            }
                             TargetEvent::Request(req) => {
-                                let _ = pin.submit_internal_command(
+                                if let Err(error) = pin.submit_internal_command(
                                     target.target_id().clone(),
                                     req,
                                     now,
-                                );
+                                ) {
+                                    pin.fail(error);
+                                    break;
+                                }
                             }
                             TargetEvent::Command(msg) => {
                                 pin.on_target_message(&mut target, msg, now);
@@ -600,6 +866,9 @@ impl Stream for Handler {
                         }
                     }
 
+                    if pin.disconnecting {
+                        break;
+                    }
                     // poll the target's event listeners
                     target.event_listeners_mut().poll(cx);
                     // poll the handler's event listeners
@@ -610,14 +879,31 @@ impl Stream for Handler {
                 }
             }
 
+            if pin.disconnecting {
+                continue;
+            }
+            pin.complete_scoped_fetches();
             let mut done = true;
 
-            while let Poll::Ready(Some(ev)) = Pin::new(&mut pin.conn).poll_next(cx) {
+            loop {
+                let ev = match Pin::new(&mut pin.conn).poll_next(cx) {
+                    Poll::Pending => break,
+                    Poll::Ready(None) => {
+                        pin.fail(CdpError::Disconnected("WebSocket EOF".into()));
+                        pin.disconnected = true;
+                        if let Some(error) = pin.failure.take() {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        return Poll::Ready(None);
+                    }
+                    Poll::Ready(Some(ev)) => ev,
+                };
                 match ev {
                     Ok(Message::Response(resp)) => {
                         pin.on_response(resp);
                         if pin.closing {
                             // handler should stop processing
+                            pin.disconnected = true;
                             return Poll::Ready(None);
                         }
                     }
@@ -633,15 +919,26 @@ impl Stream for Handler {
                     }
                     Err(err) => {
                         tracing::error!("WS Connection error: {:?}", err);
-                        return Poll::Ready(Some(Err(err)));
+                        pin.fail(err);
+                        break;
                     }
                 }
                 done = false;
+                if pin.disconnecting {
+                    break;
+                }
             }
 
+            if pin.disconnecting {
+                continue;
+            }
             if pin.evict_command_timeout.poll_ready(cx) {
                 // evict all commands that timed out
                 pin.evict_timed_out_commands(now);
+            }
+
+            if pin.disconnecting {
+                continue;
             }
 
             if done {
@@ -655,6 +952,8 @@ impl Stream for Handler {
 /// How to configure the handler
 #[derive(Debug, Clone)]
 pub struct HandlerConfig {
+    /// Opt-in граница attach; default сохраняет прежнее поведение.
+    pub connection_policy: ConnectionPolicy,
     /// Whether the `NetworkManager`s should ignore https errors
     pub ignore_https_errors: bool,
     /// Whether to ignore invalid messages
@@ -674,6 +973,7 @@ pub struct HandlerConfig {
 impl Default for HandlerConfig {
     fn default() -> Self {
         Self {
+            connection_policy: ConnectionPolicy::Legacy,
             ignore_https_errors: true,
             ignore_invalid_messages: true,
             viewport: Default::default(),
@@ -754,6 +1054,7 @@ enum PendingRequest {
 // TODO rename to BrowserMessage
 #[derive(Debug)]
 pub(crate) enum HandlerMessage {
+    Disconnect(OneshotSender<Result<()>>),
     CreatePage(CreateTargetParams, OneshotSender<Result<Page>>),
     FetchTargets(OneshotSender<Result<Vec<TargetInfo>>>),
     InsertContext(BrowserContext),

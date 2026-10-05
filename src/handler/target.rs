@@ -41,6 +41,10 @@ use chromiumoxide_cdp::cdp::js_protocol::runtime::{
 };
 use std::time::Duration;
 
+#[cfg(test)]
+#[path = "target_scoped_tests.rs"]
+mod target_scoped_tests;
+
 macro_rules! advance_state {
     ($s:ident, $cx:ident, $now:ident, $cmds: ident, $next_state:expr ) => {{
         if let Poll::Ready(poll) = $cmds.poll($now) {
@@ -54,7 +58,7 @@ macro_rules! advance_state {
                     session_id: $s.session_id.clone().map(Into::into),
                     params,
                 })),
-                Some(Err(_)) => Some($s.on_initialization_failed()),
+                Some(Err(_)) => Some($s.on_initialization_failed(CdpError::Timeout)),
             };
         } else {
             return None;
@@ -100,7 +104,10 @@ impl Target {
     pub fn new(info: TargetInfo, config: TargetConfig, browser_context: BrowserContext) -> Self {
         let ty = TargetType::new(&info.r#type);
         let request_timeout = config.request_timeout;
-        let mut network_manager = NetworkManager::new(config.ignore_https_errors, request_timeout);
+        let mut network_manager = NetworkManager::new(
+            config.ignore_https_errors && !config.non_destructive,
+            request_timeout,
+        );
 
         network_manager.set_cache_enabled(config.cache_enabled);
         network_manager.set_request_interception(config.request_intercept);
@@ -171,6 +178,9 @@ impl Target {
 
     /// Tries to create the `PageInner` if this target is already initialized
     pub(crate) fn get_or_create_page(&mut self) -> Option<&Arc<PageInner>> {
+        if self.config.non_destructive && !self.is_initialized() {
+            return None;
+        }
         self.create_page();
         self.page.as_ref().map(|p| p.inner())
     }
@@ -206,6 +216,13 @@ impl Target {
 
     /// Received a response to a command issued by this target
     pub fn on_response(&mut self, resp: Response, method: &str) {
+        if let Some(error) = resp.error {
+            if !self.is_initialized() {
+                let event = self.on_initialization_failed(CdpError::Chrome(error));
+                self.queued_events.push_back(event);
+            }
+            return;
+        }
         if let Some(cmds) = self.init_state.commands_mut() {
             cmds.received_response(method);
         }
@@ -257,6 +274,9 @@ impl Target {
 
             // `Target` events
             CdpEvent::TargetAttachedToTarget(ev) => {
+                if self.config.non_destructive {
+                    return;
+                }
                 if ev.waiting_for_debugger {
                     let runtime_cmd = RunIfWaitingForDebuggerParams::default();
 
@@ -305,11 +325,15 @@ impl Target {
     }
 
     /// Called when a init command timed out
-    fn on_initialization_failed(&mut self) -> TargetEvent {
+    pub(crate) fn on_initialization_failed(&mut self, error: CdpError) -> TargetEvent {
+        let reason = error.to_string();
         if let Some(initiator) = self.initiator.take() {
-            let _ = initiator.send(Err(CdpError::Timeout));
+            let _ = initiator.send(Err(error));
         }
         self.init_state = TargetInit::Closing;
+        if self.config.non_destructive {
+            return TargetEvent::InitializationFailed(reason);
+        }
         let close_target = CloseTargetParams::new(self.info.target_id.clone());
         TargetEvent::Request(Request {
             method: close_target.identifier(),
@@ -320,6 +344,9 @@ impl Target {
 
     /// Advance that target's state
     pub(crate) fn poll(&mut self, cx: &mut Context<'_>, now: Instant) -> Option<TargetEvent> {
+        if matches!(self.init_state, TargetInit::Closing) {
+            return self.queued_events.pop_front();
+        }
         if !self.is_page() {
             // can only poll pages
             return None;
@@ -361,7 +388,7 @@ impl Target {
                             session_id: self.session_id.clone().map(Into::into),
                             params,
                         })),
-                        Some(Err(_)) => Some(self.on_initialization_failed()),
+                        Some(Err(_)) => Some(self.on_initialization_failed(CdpError::Timeout)),
                     };
                 } else {
                     return None;
@@ -373,9 +400,13 @@ impl Target {
                     cx,
                     now,
                     cmds,
-                    TargetInit::InitializingPage(Self::page_init_commands(
-                        self.config.request_timeout
-                    ))
+                    match Self::page_init_commands(
+                        self.config.request_timeout,
+                        self.config.non_destructive
+                    ) {
+                        Ok(commands) => TargetInit::InitializingPage(commands),
+                        Err(error) => return Some(self.on_initialization_failed(error)),
+                    }
                 );
             }
             TargetInit::InitializingPage(cmds) => {
@@ -384,7 +415,12 @@ impl Target {
                     cx,
                     now,
                     cmds,
-                    match self.config.viewport.as_ref() {
+                    match self
+                        .config
+                        .viewport
+                        .as_ref()
+                        .filter(|_| !self.config.non_destructive)
+                    {
                         Some(viewport) => TargetInit::InitializingEmulation(
                             self.emulation_manager.init_commands(viewport)
                         ),
@@ -568,34 +604,37 @@ impl Target {
         self.initiator = Some(tx);
     }
 
-    pub(crate) fn page_init_commands(timeout: Duration) -> CommandChain {
-        let attach = SetAutoAttachParams::builder()
-            .flatten(true)
-            .auto_attach(true)
-            .wait_for_debugger_on_start(true)
-            .build()
-            .unwrap();
+    pub(crate) fn page_init_commands(
+        timeout: Duration,
+        non_destructive: bool,
+    ) -> Result<CommandChain> {
+        let mut commands = Vec::new();
+        if !non_destructive {
+            let attach = SetAutoAttachParams::builder()
+                .flatten(true)
+                .auto_attach(true)
+                .wait_for_debugger_on_start(true)
+                .build()
+                .map_err(CdpError::msg)?;
+            commands.push((attach.identifier(), serde_json::to_value(attach)?));
+        }
         let enable_performance = performance::EnableParams::default();
         let enable_log = cdplog::EnableParams::default();
-        CommandChain::new(
-            vec![
-                (attach.identifier(), serde_json::to_value(attach).unwrap()),
-                (
-                    enable_performance.identifier(),
-                    serde_json::to_value(enable_performance).unwrap(),
-                ),
-                (
-                    enable_log.identifier(),
-                    serde_json::to_value(enable_log).unwrap(),
-                ),
-            ],
-            timeout,
-        )
+        commands.extend([
+            (
+                enable_performance.identifier(),
+                serde_json::to_value(enable_performance)?,
+            ),
+            (enable_log.identifier(), serde_json::to_value(enable_log)?),
+        ]);
+        Ok(CommandChain::new(commands, timeout))
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct TargetConfig {
+    /// Не закрывать target и не захватывать детей/viewport при init.
+    pub non_destructive: bool,
     pub ignore_https_errors: bool,
     ///  Request timeout to use
     pub request_timeout: Duration,
@@ -607,6 +646,7 @@ pub struct TargetConfig {
 impl Default for TargetConfig {
     fn default() -> Self {
         Self {
+            non_destructive: false,
             ignore_https_errors: true,
             request_timeout: Duration::from_secs(REQUEST_TIMEOUT),
             viewport: Default::default(),
@@ -673,6 +713,7 @@ impl TargetType {
 
 #[derive(Debug)]
 pub(crate) enum TargetEvent {
+    InitializationFailed(String),
     /// An internal request
     Request(Request),
     /// An internal navigation request

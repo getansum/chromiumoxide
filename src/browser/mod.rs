@@ -26,7 +26,7 @@ use crate::cmd::{CommandMessage, to_command_response};
 use crate::conn::Connection;
 use crate::error::{BrowserStderr, CdpError, Result};
 use crate::handler::browser::BrowserContext;
-use crate::handler::{Handler, HandlerConfig, HandlerMessage};
+use crate::handler::{ConnectionPolicy, Handler, HandlerConfig, HandlerMessage};
 use crate::listeners::{EventListenerRequest, EventStream};
 use crate::page::Page;
 use crate::utils;
@@ -100,7 +100,7 @@ impl Browser {
                     } else {
                         format!(
                             "{}{}json/version",
-                            &debug_ws_url,
+                            debug_ws_url,
                             if debug_ws_url.ends_with('/') { "" } else { "/" }
                         )
                     },
@@ -196,6 +196,7 @@ impl Browser {
         let (tx, rx) = channel(1);
 
         let handler_config = HandlerConfig {
+            connection_policy: ConnectionPolicy::Legacy,
             ignore_https_errors: config.ignore_https_errors,
             ignore_invalid_messages: config.ignore_invalid_messages,
             viewport: config.viewport.clone(),
@@ -253,6 +254,14 @@ impl Browser {
             .send(HandlerMessage::CloseBrowser(tx))
             .await?;
 
+        rx.await?
+    }
+
+    /// Завершить только транспорт, не закрывая браузер или его targets.
+    /// Handler нужно продолжать опрашивать до конца stream и затем освободить.
+    pub async fn disconnect(&mut self) -> Result<()> {
+        let (tx, rx) = oneshot_channel();
+        self.sender.send(HandlerMessage::Disconnect(tx)).await?;
         rx.await?
     }
 
